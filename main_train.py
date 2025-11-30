@@ -110,9 +110,17 @@ def play_game(model, device, mcts_sims=100):
     return final_data, result, move_count
 
 
-def train_step(model, optimizer, states, policies, values, device, device_type):
+def train_step(model, optimizer, states, policies, values, device, device_type, fixed_batch_size=256):
     """Один шаг обучения."""
     model.train()
+    
+    # TPU ФИКС: Паддинг до фиксированного размера
+    actual_size = states.shape[0]
+    if device_type == 'tpu' and actual_size < fixed_batch_size:
+        pad_size = fixed_batch_size - actual_size
+        states = torch.cat([states, torch.zeros(pad_size, *states.shape[1:])])
+        policies = torch.cat([policies, torch.zeros(pad_size, *policies.shape[1:])])
+        values = torch.cat([values, torch.zeros(pad_size)])
     
     states = states.to(device)
     policies = policies.to(device)

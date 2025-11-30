@@ -169,6 +169,23 @@ class TrainingWorker(multiprocessing.Process):
         
         states, policy_targets, value_targets = batch
         
+        # TPU ФИКС: Убеждаемся что batch size фиксированный
+        # TPU компилирует граф под конкретный размер
+        actual_size = states.shape[0]
+        expected_size = config.TRAIN_BATCH_SIZE
+        
+        if self.device_type == 'tpu' and actual_size != expected_size:
+            # Паддим или обрезаем до фиксированного размера
+            if actual_size < expected_size:
+                pad_size = expected_size - actual_size
+                states = torch.cat([states, torch.zeros(pad_size, *states.shape[1:])])
+                policy_targets = torch.cat([policy_targets, torch.zeros(pad_size, *policy_targets.shape[1:])])
+                value_targets = torch.cat([value_targets, torch.zeros(pad_size)])
+            else:
+                states = states[:expected_size]
+                policy_targets = policy_targets[:expected_size]
+                value_targets = value_targets[:expected_size]
+        
         states = states.to(device)
         policy_targets = policy_targets.to(device)
         value_targets = value_targets.to(device)

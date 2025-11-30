@@ -170,16 +170,26 @@ class InferenceServer(multiprocessing.Process):
             
             for req in requests_buffer:
                 # Читаем напрямую из shared memory без копирования (zero-copy view)
-                # self.shared_inference_buffer[req.worker_id, :req.batch_size]
                 tensor_view = self.shared_inference_buffer[req.worker_id, :req.batch_size]
                 all_tensors.append(tensor_view)
                 request_sizes.append(req.batch_size)
                 worker_ids.append(req.worker_id)
             
             # Объединяем все мини-батчи в один большой батч
-            # Используем cat. Так как tensor_view находятся в shared memory (CPU),
-            # PyTorch должен эффективно перенести их на GPU.
-            full_batch = torch.cat(all_tensors).to(device, non_blocking=True)
+            full_batch = torch.cat(all_tensors)
+            actual_batch_size = full_batch.shape[0]
+            
+            # TPU ФИКС: Паддинг до фиксированного размера чтобы избежать перекомпиляции
+            # TPU компилирует граф под конкретный размер, динамические размеры = вечная перекомпиляция
+            FIXED_BATCH_SIZE = config.INFERENCE_BATCH_SIZE  # Фиксированный размер для TPU
+            
+            if device_type == 'tpu' and actual_batch_size < FIXED_BATCH_SIZE:
+                # Паддим нулями до фиксированного размера
+                padding_size = FIXED_BATCH_SIZE - actual_batch_size
+                padding = torch.zeros(padding_size, *full_batch.shape[1:], dtype=full_batch.dtype)
+                full_batch = torch.cat([full_batch, padding])
+            
+            full_batch = full_batch.to(device, non_blocking=True)
             
             # 3. Инференс
             with torch.no_grad():
@@ -193,9 +203,9 @@ class InferenceServer(multiprocessing.Process):
             if device_type == 'tpu' and TPU_AVAILABLE:
                 xm.mark_step()
             
-            # Переводим в float32 и на CPU для отправки
-            log_policies = log_policies.float().cpu()
-            values = values.float().cpu()
+            # Убираем padding перед отправкой
+            log_policies = log_policies[:actual_batch_size].float().cpu()
+            values = values[:actual_batch_size].float().cpu()
             
             # 4. Рассылка ответов
             current_idx = 0
