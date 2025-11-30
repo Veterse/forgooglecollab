@@ -1,6 +1,5 @@
 """
 Главный управляющий скрипт для распределенного обучения.
-Поддерживает TPU, CUDA и CPU.
 
 Этот скрипт инициализирует и запускает все компоненты системы:
 - Рабочий-тренер (TrainingWorker)
@@ -19,14 +18,6 @@ import platform
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR
 
-# TPU support
-try:
-    import torch_xla
-    import torch_xla.core.xla_model as xm
-    TPU_AVAILABLE = True
-except ImportError:
-    TPU_AVAILABLE = False
-
 # --- Локальные импорты ---
 import rl_chess.config as config
 from rl_chess.RL_network import ChessNetwork
@@ -34,6 +25,7 @@ from rl_chess.shared_buffer import SharedReplayBuffer
 from rl_chess.self_play_worker import SelfPlayWorker
 from rl_chess.training_worker import TrainingWorker
 from rl_chess.inference_server import InferenceServer
+import multiprocessing
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -128,7 +120,7 @@ def main():
     # Общая очередь для входящих запросов от всех воркеров
     input_queue = multiprocessing.Queue()
     
-    num_workers = 20 # Количество рабочих-игроков (больше = быстрее генерация)
+    num_workers = 8  # Количество рабочих-игроков (больше = быстрее генерация)
     # Личные очереди ответов для каждого воркера
     output_queues = [multiprocessing.Queue() for _ in range(num_workers)]
     
@@ -142,10 +134,17 @@ def main():
     
     replay_buffer = SharedReplayBuffer(config.MAX_REPLAY_BUFFER_SIZE)
 
-    # ПРИНУДИТЕЛЬНО CPU (TPU на Colab не работает с multiprocessing)
-    device = torch.device('cpu')
-    device_type = 'cpu'
-    logging.info("✅ Используется CPU (принудительно для совместимости с multiprocessing)")
+    # Глобальные CUDA/cuDNN оптимизации (если тренировка идёт на GPU)
+    if config.TRAINING_DEVICE == 'cuda' and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
 
     model = ChessNetwork()
     
@@ -155,12 +154,11 @@ def main():
     # Загружаем чекпоинт в чистую модель ДО компиляции
     load_checkpoint(model, optimizer, scheduler, training_step_counter, total_games_played_counter, white_wins, black_wins, draws)
 
-    # torch.compile() только для CUDA на Linux (не TPU, не Windows)
-    if (not IS_WINDOWS) and device_type == 'cuda':
+    # На Linux/WSL при наличии CUDA используем torch.compile() для ускорения.
+    # На Windows оставляем модель без компиляции из-за ограничений multiprocessing/pickling.
+    if (not IS_WINDOWS) and config.TRAINING_DEVICE == 'cuda' and torch.cuda.is_available():
         logging.info("Компиляция модели с помощью torch.compile() (Linux/WSL, ожидается ускорение)...")
         model = torch.compile(model, mode="max-autotune")
-    elif device_type == 'tpu':
-        logging.info("TPU режим - torch.compile() не используется")
     else:
         logging.info("Запуск распределённого обучения без torch.compile() (совместимо с multiprocessing на Windows или без CUDA)...")
 

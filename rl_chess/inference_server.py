@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Модуль Inference Server.
-Обеспечивает централизованное выполнение предсказаний нейросети на GPU/TPU.
-Собирает запросы от множества воркеров в батчи (Batching) для максимальной утилизации.
+Обеспечивает централизованное выполнение предсказаний нейросети на GPU.
+Собирает запросы от множества воркеров в батчи (Batching) для максимальной утилизации GPU.
 """
 import multiprocessing
 import torch
@@ -10,13 +10,6 @@ import time
 import queue
 import logging
 from collections import namedtuple
-
-# TPU support
-try:
-    import torch_xla.core.xla_model as xm
-    TPU_AVAILABLE = True
-except ImportError:
-    TPU_AVAILABLE = False
 
 import rl_chess.config as config
 from rl_chess.RL_network import ChessNetwork
@@ -66,7 +59,7 @@ class InferenceServer(multiprocessing.Process):
         self.output_queues = output_queues
         self.shared_inference_buffer = shared_inference_buffer
         self.name = "InferenceServer"
-        self.daemon = False  # НЕ daemon чтобы видеть ошибки
+        self.daemon = True # Чтобы процесс умирал вместе с главным
         self.stop_event = multiprocessing.Event()
 
     def set_model(self, model):
@@ -74,10 +67,6 @@ class InferenceServer(multiprocessing.Process):
         self.input_model = model
 
     def run(self):
-        # СРАЗУ пишем в stdout чтобы точно увидеть
-        import sys
-        print(">>> InferenceServer.run() STARTED", file=sys.stderr, flush=True)
-        
         # Настройка логирования
         logging.basicConfig(
             level=logging.INFO,
@@ -88,52 +77,22 @@ class InferenceServer(multiprocessing.Process):
             ]
         )
         
-        try:
-            self._run_server()
-        except Exception as e:
-            print(f">>> InferenceServer CRASHED: {e}", file=sys.stderr, flush=True)
-            logging.error(f"❌ InferenceServer CRASHED: {e}")
-            import traceback
-            tb = traceback.format_exc()
-            print(tb, file=sys.stderr, flush=True)
-            logging.error(tb)
-            raise
-    
-    def _run_server(self):
-        import sys
-        print(">>> _run_server: START", file=sys.stderr, flush=True)
-        
-        # ПРИНУДИТЕЛЬНО CPU (TPU на Colab не работает с multiprocessing)
-        device = torch.device('cpu')
-        device_type = 'cpu'
-        print(">>> _run_server: device created", file=sys.stderr, flush=True)
-        logging.info("🚀 Inference Server запущен на CPU (принудительно)")
+        device = torch.device(config.TRAINING_DEVICE) # Инференс крутим там же где и тренировку, на мощной GPU
+        logging.info(f"🚀 Inference Server запущен на {device}. Ожидание запросов...")
 
-        # Инициализация модели
-        print(">>> _run_server: creating model...", file=sys.stderr, flush=True)
+        # Инициализация модели на GPU
         model = ChessNetwork().to(device)
-        print(">>> _run_server: model created", file=sys.stderr, flush=True)
         model.eval()
         
-        # Синхронизация весов через файл (shared memory зависает на Colab)
-        import os
-        weights_file = "inference_weights.pth"
-        if os.path.exists(weights_file):
-            model.load_state_dict(torch.load(weights_file, map_location=device))
-            logging.info(f"Веса загружены из {weights_file}")
-        elif os.path.exists(config.MODEL_PATH):
-            model.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
-            logging.info(f"Веса загружены из {config.MODEL_PATH}")
+        # Первоначальная синхронизация весов
+        if self.input_model:
+            model.load_state_dict(self.input_model.state_dict())
+            logging.info("Веса модели загружены из shared memory.")
         else:
-            logging.info("Используются случайные веса (файл весов не найден)")
-        
-        print(">>> _run_server: entering main loop", file=sys.stderr, flush=True)
-        
-        last_sync_time = time.time()
-        SYNC_INTERVAL = 10.0  # Синхронизировать веса каждые 10 секунд
+            logging.warning("Внимание: Входная модель не передана, используются случайные веса!")
 
-        # Подготовка к AMP (Mixed Precision) - только для CUDA
-        use_amp = (device_type == 'cuda')
+        # Подготовка к AMP (Mixed Precision)
+        use_amp = (device.type == 'cuda')
         dtype = torch.float16 if use_amp else torch.float32
         if use_amp and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
@@ -176,7 +135,12 @@ class InferenceServer(multiprocessing.Process):
                         break
             
             if not requests_buffer:
-                # Просто ждём запросы (синхронизация весов отключена - зависает на Colab)
+                # Если работы нет, проверим не пора ли обновить веса
+                if time.time() - last_sync_time > SYNC_INTERVAL:
+                    if self.input_model:
+                        # Загружаем веса из разделяемой памяти (это быстро, т.к. копирование из RAM в VRAM)
+                        model.load_state_dict(self.input_model.state_dict())
+                    last_sync_time = time.time()
                 continue
 
             # 2. Подготовка данных
@@ -188,28 +152,25 @@ class InferenceServer(multiprocessing.Process):
             
             for req in requests_buffer:
                 # Читаем напрямую из shared memory без копирования (zero-copy view)
+                # self.shared_inference_buffer[req.worker_id, :req.batch_size]
                 tensor_view = self.shared_inference_buffer[req.worker_id, :req.batch_size]
                 all_tensors.append(tensor_view)
                 request_sizes.append(req.batch_size)
                 worker_ids.append(req.worker_id)
             
             # Объединяем все мини-батчи в один большой батч
-            full_batch = torch.cat(all_tensors)
-            actual_batch_size = full_batch.shape[0]
-            
-            full_batch = full_batch.to(device)
+            # Используем cat. Так как tensor_view находятся в shared memory (CPU),
+            # PyTorch должен эффективно перенести их на GPU.
+            full_batch = torch.cat(all_tensors).to(device, non_blocking=True)
             
             # 3. Инференс
             with torch.no_grad():
-                if use_amp:
-                    with torch.autocast(device_type='cuda', dtype=dtype):
-                        log_policies, values = model(full_batch)
-                else:
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=use_amp):
                     log_policies, values = model(full_batch)
             
-            # Результаты уже на CPU
-            log_policies = log_policies[:actual_batch_size].float()
-            values = values[:actual_batch_size].float()
+            # Переводим в float32 и на CPU для отправки
+            log_policies = log_policies.float().cpu()
+            values = values.float().cpu()
             
             # 4. Рассылка ответов
             current_idx = 0
@@ -225,12 +186,9 @@ class InferenceServer(multiprocessing.Process):
                 self.output_queues[worker_id].put((worker_policy, worker_value))
             
             requests_buffer.clear()
-            
-            # Периодическая синхронизация весов через файл
+
+            # Периодическая синхронизация весов (даже если идет активная работа)
             if time.time() - last_sync_time > SYNC_INTERVAL:
-                if os.path.exists(weights_file):
-                    try:
-                        model.load_state_dict(torch.load(weights_file, map_location=device))
-                    except Exception:
-                        pass  # Файл может быть в процессе записи
+                if self.input_model:
+                    model.load_state_dict(self.input_model.state_dict())
                 last_sync_time = time.time()

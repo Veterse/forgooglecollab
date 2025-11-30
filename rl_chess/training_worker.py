@@ -3,7 +3,9 @@
 Процесс-тренер (Training Worker).
 
 Этот процесс отвечает за непрерывное обучение нейронной сети.
-Поддерживает TPU, CUDA и CPU.
+Он запрашивает батчи данных у ReplayBufferServer, выполняет шаги
+оптимизации на GPU и периодически отправляет обновленные веса
+модели в ModelServer.
 """
 import multiprocessing
 import torch
@@ -15,13 +17,6 @@ import os
 from torch.utils.data import DataLoader, TensorDataset
 from torch.nn import MSELoss, CrossEntropyLoss
 from torch.cuda.amp import autocast, GradScaler
-
-# TPU support
-try:
-    import torch_xla.core.xla_model as xm
-    TPU_AVAILABLE = True
-except ImportError:
-    TPU_AVAILABLE = False
 
 import rl_chess.config as config
 from rl_chess.RL_network import ChessNetwork
@@ -53,16 +48,22 @@ class TrainingWorker(multiprocessing.Process):
         Основной цикл жизни процесса.
         """
         setup_worker_logging()
-        
-        # ПРИНУДИТЕЛЬНО CPU (TPU на Colab не работает с multiprocessing)
-        device = torch.device('cpu')
-        self.device_type = 'cpu'
-        logging.info("🚀 Training Worker запущен на CPU (принудительно)")
-        
-        self.device = device
+        device = torch.device(config.TRAINING_DEVICE)
         self.model.to(device)
 
-        logging.info("Смешанная точность: Выключена (float32)")
+        # <<< НАЧАЛО ИЗМЕНЕНИЙ
+        # ОТКЛЮЧАЕМ Mixed Precision, так как она ломает обучение Policy Head
+        # use_bfloat16 = (device.type == 'cuda' and torch.cuda.is_bf16_supported())
+        use_bfloat16 = False
+        
+        # GradScaler нужен для float16, но безопасен и для bfloat16 (хотя и менее критичен)
+        # self.scaler = GradScaler(enabled=use_bfloat16)
+        self.scaler = None # Отключаем scaler
+        
+        log_message = f"🚀 Процесс запущен на [{device}]. "
+        log_message += "Смешанная точность: Выключена (используется float32) [FORCED FIX]"
+        logging.info(log_message)
+        # <<< КОНЕЦ ИЗМЕНЕНИЙ
 
         # Отслеживаем сколько данных было при последнем обучении
         last_trained_buffer_size = 0
@@ -99,17 +100,14 @@ class TrainingWorker(multiprocessing.Process):
                 last_log_time = time.time()
             
             batch = self.replay_buffer.sample(config.TRAIN_BATCH_SIZE)
-            self.update_network(batch, device)
+
+            # <<< ИЗМЕНЕНИЕ ЗДЕСЬ
+            # Передаем флаг use_bfloat16 в метод update_network
+            self.update_network(batch, device, use_bfloat16)
+            # <<< КОНЕЦ ИЗМЕНЕНИЯ
             
             # Обновляем счётчик после успешного обучения
             last_trained_buffer_size = current_buffer_size
-            
-            # Сохраняем веса для InferenceServer каждые 5 шагов
-            if self.training_step_counter.value % 5 == 0:
-                try:
-                    torch.save(self.model.state_dict(), "inference_weights.pth")
-                except Exception:
-                    pass
             
             if self.training_step_counter.value % config.SAVE_CHECKPOINT_EVERY_N_STEPS == 0:
                 self._save_checkpoint()
@@ -152,13 +150,14 @@ class TrainingWorker(multiprocessing.Process):
             if os.path.exists(temp_checkpoint_path):
                 os.remove(temp_checkpoint_path)
 
-    def update_network(self, batch, device):
+    def update_network(self, batch, device, use_bfloat16):
         """
-        Выполняет один шаг обновления весов общей модели.
+        Выполняет один шаг обновления весов общей модели, блокируя ее на время обновления.
         """
         self.model.train()
         
         states, policy_targets, value_targets = batch
+        
         states = states.to(device)
         policy_targets = policy_targets.to(device)
         value_targets = value_targets.to(device)
