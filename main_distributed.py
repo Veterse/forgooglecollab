@@ -128,7 +128,7 @@ def main():
     # Общая очередь для входящих запросов от всех воркеров
     input_queue = multiprocessing.Queue()
     
-    num_workers = 8  # Количество рабочих-игроков (больше = быстрее генерация)
+    num_workers = 20 # Количество рабочих-игроков (больше = быстрее генерация)
     # Личные очереди ответов для каждого воркера
     output_queues = [multiprocessing.Queue() for _ in range(num_workers)]
     
@@ -143,17 +143,19 @@ def main():
     replay_buffer = SharedReplayBuffer(config.MAX_REPLAY_BUFFER_SIZE)
 
     # Определяем устройство (TPU > CUDA > CPU)
+    global TPU_AVAILABLE  # Нужно для изменения глобальной переменной
+    
+    tpu_ok = False
     if TPU_AVAILABLE:
         try:
             device = xm.xla_device()
             device_type = 'tpu'
+            tpu_ok = True
             logging.info(f"✅ TPU доступен: {device}")
         except RuntimeError as e:
             logging.warning(f"⚠️ TPU недоступен: {e}")
-            TPU_AVAILABLE = False
-            # Продолжаем проверку CUDA/CPU ниже
     
-    if not TPU_AVAILABLE and torch.cuda.is_available():
+    if not tpu_ok and torch.cuda.is_available():
         device = torch.device('cuda')
         device_type = 'cuda'
         logging.info(f"✅ CUDA доступен: {torch.cuda.get_device_name(0)}")
@@ -167,7 +169,7 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
         if hasattr(torch.backends.cudnn, "allow_tf32"):
             torch.backends.cudnn.allow_tf32 = True
-    elif not TPU_AVAILABLE:
+    elif not tpu_ok:
         device = torch.device('cpu')
         device_type = 'cpu'
         logging.info("⚠️ Используется CPU")
